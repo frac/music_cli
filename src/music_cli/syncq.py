@@ -1,36 +1,47 @@
-"""A debounced, concurrent background download queue.
+"""A debounced, bidirectional sync queue for the browse UI.
 
-This is the heart of the ``browse`` UX: selecting a track schedules a download
-that only starts after a short *debounce* window, so a track picked and unpicked
-by accident is never transferred. The kid keeps browsing while a small pool of
-workers copies the confirmed selections.
+Each track has a *desired* end state — on the card (ticked) or off it
+(un-ticked). Ticking or un-ticking sets that target and (re)starts a short
+**debounce** timer; only once the timer settles does the queue act:
 
-The queue is intentionally generic — it knows nothing about HTTP or catalogs.
-Each item carries an opaque ``payload`` handed to an injected async
-``downloader`` coroutine, which keeps this module unit-testable with a fake
-clock and a fake downloader.
+* target on-card, not there yet  → download it,
+* target off-card, currently there or downloading → **abort any download and
+  delete** the copy.
+
+Because a flip resets the timer, a mistake corrected within the debounce window
+does nothing at all — in either direction. The queue is generic: it is handed an
+async ``download`` and an async ``remove`` callable, which keeps it unit-testable
+with a fake clock and fakes.
 """
 
 from __future__ import annotations
 
 import asyncio
 import contextlib
+import functools
 import time
 from collections.abc import Awaitable
 from collections.abc import Callable
+from collections.abc import Iterable
 from dataclasses import dataclass
-from dataclasses import field
 from enum import StrEnum
 
 
-class DownloadState(StrEnum):
-    """Lifecycle states reported through the event callback."""
+class TrackState(StrEnum):
+    """Observable per-track state (for the progress footer)."""
 
-    PENDING = "pending"
     DOWNLOADING = "downloading"
-    DONE = "done"
+    REMOVING = "removing"
+    PRESENT = "present"
+    ABSENT = "absent"
     FAILED = "failed"
-    CANCELLED = "cancelled"
+
+
+class Intent(StrEnum):
+    """The user's desired end state for a track."""
+
+    PRESENT = "present"
+    ABSENT = "absent"
 
 
 @dataclass(frozen=True, slots=True)
@@ -42,139 +53,199 @@ class DownloadItem:
 
 
 Downloader = Callable[[DownloadItem], Awaitable[None]]
-EventHook = Callable[[str, DownloadState], None]
+Remover = Callable[[str], Awaitable[None]]
+EventHook = Callable[[str, TrackState], None]
 
 
-@dataclass(slots=True)
-class DownloadQueue:
-    """Schedule and run debounced background downloads.
+class SyncQueue:
+    """Reconcile each track towards its debounced desired state."""
 
-    Args:
-        downloader: Coroutine that performs one download; may raise to signal
-            failure (which triggers a retry).
-        debounce: Seconds a selection must persist before its download starts.
-        concurrency: Maximum simultaneous in-flight downloads.
-        max_attempts: Attempts per item before it is marked failed.
-        on_event: Optional callback invoked on every state transition.
-        clock: Monotonic time source (injectable for tests).
-    """
+    def __init__(
+        self,
+        *,
+        download: Downloader,
+        remove: Remover,
+        debounce: float = 5.0,
+        concurrency: int = 3,
+        max_attempts: int = 3,
+        on_event: EventHook | None = None,
+        clock: Callable[[], float] = time.monotonic,
+        present: Iterable[str] = (),
+    ) -> None:
+        self._download = download
+        self._remove = remove
+        self.debounce = debounce
+        self.concurrency = concurrency
+        self.max_attempts = max_attempts
+        self._on_event = on_event
+        self._clock = clock
 
-    downloader: Downloader
-    debounce: float = 5.0
-    concurrency: int = 3
-    max_attempts: int = 3
-    on_event: EventHook | None = None
-    clock: Callable[[], float] = time.monotonic
+        self._items: dict[str, DownloadItem] = {}
+        self._desired: dict[str, Intent] = {}
+        self._deadline: dict[str, float] = {}
+        self._state: dict[str, TrackState] = {}
+        self._tasks: dict[str, asyncio.Task[None]] = {}
+        self._goal: dict[str, Intent] = {}
+        self._done_count = 0
 
-    _pending: dict[str, float] = field(default_factory=dict, init=False)
-    _items: dict[str, DownloadItem] = field(default_factory=dict, init=False)
-    _inflight: set[str] = field(default_factory=set, init=False)
-    _done: set[str] = field(default_factory=set, init=False)
-    _failed: set[str] = field(default_factory=set, init=False)
-    _running: bool = field(default=False, init=False)
-    _changed: asyncio.Event = field(default_factory=asyncio.Event, init=False)
-    _sem: asyncio.Semaphore | None = field(default=None, init=False)
+        self._running = False
+        self._changed = asyncio.Event()
+        self._sem: asyncio.Semaphore | None = None
 
-    # -- selection API (called from the UI) --------------------------------
+        self.seed_present(present)
+
+    # -- seeding & intent --------------------------------------------------
+
+    def seed_present(self, keys: Iterable[str]) -> None:
+        """Mark tracks already on the card as present (and thus ticked)."""
+        for key in keys:
+            self._state[key] = TrackState.PRESENT
+            self._desired.setdefault(key, Intent.PRESENT)
 
     def select(self, item: DownloadItem) -> None:
-        """Schedule ``item`` for download after the debounce window."""
-        key = item.key
-        if key in self._done or key in self._inflight or key in self._pending:
-            return
-        self._failed.discard(key)  # allow re-selecting a previously failed item
-        self._items[key] = item
-        self._pending[key] = self.clock() + self.debounce
-        self._emit(key, DownloadState.PENDING)
-        self._wake()
+        """Request that ``item`` end up on the card (debounced)."""
+        self._items[item.key] = item
+        self._request(item.key, Intent.PRESENT)
 
     def deselect(self, key: str) -> None:
-        """Cancel a still-pending download (no effect once it has started)."""
-        if self._pending.pop(key, None) is not None:
-            self._emit(key, DownloadState.CANCELLED)
-            self._wake()
+        """Request that ``key`` end up off the card (debounced)."""
+        self._request(key, Intent.ABSENT)
 
-    def due_keys(self, now: float) -> list[str]:
-        """Return pending keys whose debounce window has elapsed by ``now``."""
-        return [key for key, deadline in self._pending.items() if deadline <= now]
+    def _request(self, key: str, intent: Intent) -> None:
+        self._desired[key] = intent
+        self._deadline[key] = self._clock() + self.debounce
+        self._emit(key)
+        self._wake()
+
+    # -- queries -----------------------------------------------------------
+
+    def wants_present(self, key: str) -> bool:
+        """Whether the track's current *intent* is to be on the card (ticked)."""
+        intent = self._desired.get(key)
+        if intent is not None:
+            return intent is Intent.PRESENT
+        return self._state.get(key) is TrackState.PRESENT
+
+    def state(self, key: str) -> TrackState | None:
+        """Return the observable state of ``key`` (``None`` if unknown)."""
+        return self._state.get(key)
 
     def counts(self) -> dict[str, int]:
-        """Return current totals per state, for progress display."""
-        return {
-            "pending": len(self._pending),
-            "downloading": len(self._inflight),
-            "done": len(self._done),
-            "failed": len(self._failed),
+        """Return totals for the progress footer."""
+        counts = {
+            "pending": len(self._deadline),
+            "downloading": 0,
+            "removing": 0,
+            "failed": 0,
+            "done": self._done_count,
         }
+        for state in self._state.values():
+            if state is TrackState.DOWNLOADING:
+                counts["downloading"] += 1
+            elif state is TrackState.REMOVING:
+                counts["removing"] += 1
+            elif state is TrackState.FAILED:
+                counts["failed"] += 1
+        return counts
 
-    def state(self, key: str) -> DownloadState | None:
-        """Return the current state of ``key`` (or ``None`` if unknown)."""
-        if key in self._done:
-            return DownloadState.DONE
-        if key in self._inflight:
-            return DownloadState.DOWNLOADING
-        if key in self._pending:
-            return DownloadState.PENDING
-        if key in self._failed:
-            return DownloadState.FAILED
-        return None
+    def due_keys(self, now: float) -> list[str]:
+        """Return keys whose debounce window has elapsed by ``now``."""
+        return [key for key, deadline in self._deadline.items() if deadline <= now]
 
     # -- runner ------------------------------------------------------------
 
     async def run(self) -> None:
-        """Run the scheduling loop until :meth:`stop` is called."""
+        """Run the reconcile loop until :meth:`stop` is called."""
         self._running = True
         self._sem = asyncio.Semaphore(self.concurrency)
-        tasks: set[asyncio.Task[None]] = set()
         while self._running:
-            now = self.clock()
+            now = self._clock()
             for key in self.due_keys(now):
-                del self._pending[key]
-                self._inflight.add(key)
-                self._emit(key, DownloadState.DOWNLOADING)
-                task = asyncio.create_task(self._download(self._items[key]))
-                tasks.add(task)
-                task.add_done_callback(tasks.discard)
-
+                del self._deadline[key]
+                self._reconcile(key)
             self._changed.clear()
             with contextlib.suppress(TimeoutError):
                 await asyncio.wait_for(self._changed.wait(), self._next_wait(now))
 
-        if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
+        for task in list(self._tasks.values()):
+            task.cancel()
+        if self._tasks:
+            await asyncio.gather(*self._tasks.values(), return_exceptions=True)
 
     def stop(self) -> None:
-        """Ask the runner to finish (drains any in-flight downloads)."""
+        """Ask the runner to finish, cancelling any in-flight work."""
         self._running = False
         self._wake()
 
-    def _next_wait(self, now: float) -> float | None:
-        if not self._pending:
-            return None
-        return max(0.0, min(self._pending.values()) - now)
+    def _reconcile(self, key: str) -> None:
+        target = self._desired.get(key)
+        if target is None:
+            return
+        running = self._tasks.get(key)
+        if running is not None and not running.done():
+            if self._goal.get(key) is target:
+                return  # already working towards the desired state
+            running.cancel()  # abort the opposite action (e.g. a download)
+        current = self._state.get(key)
+        if target is Intent.PRESENT:
+            if current is not TrackState.PRESENT:
+                self._start(key, Intent.PRESENT)
+        # Only delete something that is actually on the card or mid-download;
+        # un-ticking a track that was never there is a no-op.
+        elif current in (TrackState.PRESENT, TrackState.DOWNLOADING):
+            self._start(key, Intent.ABSENT)
 
-    async def _download(self, item: DownloadItem) -> None:
+    def _start(self, key: str, target: Intent) -> None:
+        self._goal[key] = target
+        if target is Intent.PRESENT:
+            self._set(key, TrackState.DOWNLOADING)
+            task = asyncio.create_task(self._run_download(key))
+        else:
+            self._set(key, TrackState.REMOVING)
+            task = asyncio.create_task(self._run_remove(key))
+        self._tasks[key] = task
+        task.add_done_callback(functools.partial(self._task_done, key))
+
+    def _task_done(self, key: str, task: asyncio.Task[None]) -> None:
+        if self._tasks.get(key) is task:
+            self._tasks.pop(key, None)
+
+    async def _run_download(self, key: str) -> None:
         assert self._sem is not None
+        item = self._items[key]
         async with self._sem:
             for attempt in range(1, self.max_attempts + 1):
                 try:
-                    await self.downloader(item)
-                except Exception:  # any failure triggers a retry / mark-failed
+                    await self._download(item)
+                except asyncio.CancelledError:
+                    raise  # aborted by an un-tick; the remove task takes over
+                except Exception:  # retry, or mark failed after last attempt
                     if attempt >= self.max_attempts:
-                        self._inflight.discard(item.key)
-                        self._failed.add(item.key)
-                        self._emit(item.key, DownloadState.FAILED)
+                        self._set(key, TrackState.FAILED)
                         return
                     continue
                 else:
-                    self._inflight.discard(item.key)
-                    self._done.add(item.key)
-                    self._emit(item.key, DownloadState.DONE)
+                    self._done_count += 1
+                    self._set(key, TrackState.PRESENT)
                     return
+
+    async def _run_remove(self, key: str) -> None:
+        with contextlib.suppress(Exception):
+            await self._remove(key)
+        self._set(key, TrackState.ABSENT)
+
+    def _next_wait(self, now: float) -> float | None:
+        if not self._deadline:
+            return None
+        return max(0.0, min(self._deadline.values()) - now)
+
+    def _set(self, key: str, state: TrackState) -> None:
+        self._state[key] = state
+        self._emit(key)
 
     def _wake(self) -> None:
         self._changed.set()
 
-    def _emit(self, key: str, state: DownloadState) -> None:
-        if self.on_event is not None:
-            self.on_event(key, state)
+    def _emit(self, key: str) -> None:
+        if self._on_event is not None:
+            self._on_event(key, self._state.get(key, TrackState.ABSENT))

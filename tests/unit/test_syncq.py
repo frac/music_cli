@@ -1,12 +1,12 @@
-"""Unit tests for the debounced background download queue."""
+"""Tests for the debounced bidirectional sync queue."""
 
 import asyncio
 
 import pytest
 
 from music_cli.syncq import DownloadItem
-from music_cli.syncq import DownloadQueue
-from music_cli.syncq import DownloadState
+from music_cli.syncq import SyncQueue
+from music_cli.syncq import TrackState
 
 
 class FakeClock:
@@ -23,150 +23,223 @@ def _item(key: str) -> DownloadItem:
     return DownloadItem(key=key, payload=key)
 
 
-async def _noop(_: DownloadItem) -> None:
+async def _noop_download(_: DownloadItem) -> None:
     return None
 
 
-# -- pure debounce logic (no event loop needed) ----------------------------
+async def _noop_remove(_: str) -> None:
+    return None
 
 
-def test_select_becomes_due_only_after_debounce():
+def _queue(**kw) -> SyncQueue:
+    kw.setdefault("download", _noop_download)
+    kw.setdefault("remove", _noop_remove)
+    return SyncQueue(**kw)
+
+
+# -- pure intent / debounce logic (no event loop) --------------------------
+
+
+def test_intent_and_due():
     clock = FakeClock(0.0)
-    q = DownloadQueue(downloader=_noop, debounce=5.0, clock=clock)
+    q = _queue(debounce=5.0, clock=clock)
 
+    assert q.wants_present("a") is False
     q.select(_item("a"))
-    assert q.state("a") is DownloadState.PENDING
-    clock.t = 4.9
-    assert q.due_keys(clock.t) == []
-    clock.t = 5.0
-    assert q.due_keys(clock.t) == ["a"]
+    assert q.wants_present("a") is True
+    assert q.due_keys(4.9) == []
+    assert q.due_keys(5.0) == ["a"]
 
-
-def test_deselect_before_debounce_cancels():
-    clock = FakeClock(0.0)
-    events: list[tuple[str, DownloadState]] = []
-    q = DownloadQueue(
-        downloader=_noop,
-        debounce=5.0,
-        clock=clock,
-        on_event=lambda k, s: events.append((k, s)),
-    )
-
-    q.select(_item("a"))
-    clock.t = 3.0
     q.deselect("a")
-    assert ("a", DownloadState.CANCELLED) in events
-    # Cancelled items become schedulable-from-scratch again (transient state).
-    assert q.state("a") is None
-    clock.t = 10.0
-    assert q.due_keys(clock.t) == []
+    assert q.wants_present("a") is False
 
 
-def test_reselect_is_deduplicated():
-    clock = FakeClock(0.0)
-    q = DownloadQueue(downloader=_noop, debounce=5.0, clock=clock)
-
-    q.select(_item("a"))
-    clock.t = 2.0
-    q.select(_item("a"))  # ignored; deadline stays at 5.0
-    clock.t = 5.0
-    assert q.due_keys(clock.t) == ["a"]
+def test_seed_present_marks_ticked():
+    q = _queue(present=["a"])
+    assert q.wants_present("a") is True
+    assert q.state("a") is TrackState.PRESENT
 
 
-# -- async runner behaviour -------------------------------------------------
+# -- runner behaviour -------------------------------------------------------
 
 
-async def test_runner_downloads_after_debounce():
+async def _run(q: SyncQueue):
+    task = asyncio.create_task(q.run())
+    return task
+
+
+async def test_select_downloads_after_debounce():
     downloaded: list[str] = []
     done = asyncio.Event()
 
-    async def downloader(item: DownloadItem) -> None:
+    async def dl(item: DownloadItem) -> None:
         downloaded.append(item.key)
 
-    def on_event(key: str, state: DownloadState) -> None:
-        if state is DownloadState.DONE:
+    def ev(_key: str, state: TrackState) -> None:
+        if state is TrackState.PRESENT:
             done.set()
 
-    q = DownloadQueue(downloader=downloader, debounce=0.02, on_event=on_event)
-    runner = asyncio.create_task(q.run())
+    q = _queue(download=dl, debounce=0.02, on_event=ev)
+    task = await _run(q)
 
     q.select(_item("song"))
-    await asyncio.wait_for(done.wait(), timeout=1.0)
+    await asyncio.wait_for(done.wait(), 1.0)
     assert downloaded == ["song"]
-    assert q.state("song") is DownloadState.DONE
+    assert q.state("song") is TrackState.PRESENT
 
     q.stop()
-    await runner
+    await task
 
 
-async def test_runner_skips_cancelled_selection():
+async def test_select_then_deselect_within_grace_does_nothing():
     downloaded: list[str] = []
+    removed: list[str] = []
 
-    async def downloader(item: DownloadItem) -> None:
+    async def dl(item: DownloadItem) -> None:
         downloaded.append(item.key)
 
-    q = DownloadQueue(downloader=downloader, debounce=0.05)
-    runner = asyncio.create_task(q.run())
+    async def rm(key: str) -> None:
+        removed.append(key)
+
+    q = _queue(download=dl, remove=rm, debounce=0.05)
+    task = await _run(q)
 
     q.select(_item("oops"))
-    q.deselect("oops")  # cancelled well before the 50ms window
+    q.deselect("oops")  # corrected well within the window
     await asyncio.sleep(0.15)
     assert downloaded == []
+    assert removed == []
 
     q.stop()
-    await runner
+    await task
 
 
-async def test_runner_retries_then_marks_failed():
+async def test_deselect_present_removes_after_debounce():
+    removed: list[str] = []
+    gone = asyncio.Event()
+
+    async def rm(key: str) -> None:
+        removed.append(key)
+
+    def ev(_key: str, state: TrackState) -> None:
+        if state is TrackState.ABSENT:
+            gone.set()
+
+    q = _queue(remove=rm, debounce=0.02, on_event=ev, present=["a"])
+    task = await _run(q)
+
+    q.deselect("a")
+    await asyncio.wait_for(gone.wait(), 1.0)
+    assert removed == ["a"]
+    assert q.state("a") is TrackState.ABSENT
+
+    q.stop()
+    await task
+
+
+async def test_deselect_then_reselect_within_grace_keeps_file():
+    removed: list[str] = []
+
+    async def rm(key: str) -> None:
+        removed.append(key)
+
+    q = _queue(remove=rm, debounce=0.05, present=["a"])
+    task = await _run(q)
+
+    q.deselect("a")
+    q.select(_item("a"))  # changed my mind within the window
+    await asyncio.sleep(0.15)
+    assert removed == []  # never deleted
+    assert q.wants_present("a") is True
+
+    q.stop()
+    await task
+
+
+async def test_untick_aborts_in_flight_download_then_removes():
+    started = asyncio.Event()
+    cancelled = asyncio.Event()
+    gone = asyncio.Event()
+    removed: list[str] = []
+
+    async def dl(_: DownloadItem) -> None:
+        started.set()
+        try:
+            await asyncio.Event().wait()  # block forever until cancelled
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+
+    async def rm(key: str) -> None:
+        removed.append(key)
+
+    def ev(_key: str, state: TrackState) -> None:
+        if state is TrackState.ABSENT:
+            gone.set()
+
+    q = _queue(download=dl, remove=rm, debounce=0.02, on_event=ev)
+    task = await _run(q)
+
+    q.select(_item("a"))
+    await asyncio.wait_for(started.wait(), 1.0)  # download is in flight
+    q.deselect("a")
+    await asyncio.wait_for(cancelled.wait(), 1.0)  # download aborted
+    await asyncio.wait_for(gone.wait(), 1.0)
+
+    assert cancelled.is_set()  # the download was aborted
+    assert removed == ["a"]  # then the copy was deleted
+    assert q.state("a") is TrackState.ABSENT
+
+    q.stop()
+    await task
+
+
+async def test_download_retries_then_fails():
     attempts = 0
     failed = asyncio.Event()
 
-    async def flaky(_: DownloadItem) -> None:
+    async def dl(_: DownloadItem) -> None:
         nonlocal attempts
         attempts += 1
         raise OSError("boom")
 
-    def on_event(key: str, state: DownloadState) -> None:
-        if state is DownloadState.FAILED:
+    def ev(_key: str, state: TrackState) -> None:
+        if state is TrackState.FAILED:
             failed.set()
 
-    q = DownloadQueue(
-        downloader=flaky, debounce=0.01, max_attempts=3, on_event=on_event
-    )
-    runner = asyncio.create_task(q.run())
+    q = _queue(download=dl, debounce=0.01, max_attempts=3, on_event=ev)
+    task = await _run(q)
 
     q.select(_item("bad"))
-    await asyncio.wait_for(failed.wait(), timeout=1.0)
+    await asyncio.wait_for(failed.wait(), 1.0)
     assert attempts == 3
-    assert q.state("bad") is DownloadState.FAILED
+    assert q.state("bad") is TrackState.FAILED
 
     q.stop()
-    await runner
+    await task
 
 
 @pytest.mark.parametrize("n", [1, 2])
-async def test_runner_recovers_on_retry(n: int):
+async def test_download_recovers_on_retry(n: int):
     calls = 0
     done = asyncio.Event()
 
-    async def flaky(_: DownloadItem) -> None:
+    async def dl(_: DownloadItem) -> None:
         nonlocal calls
         calls += 1
         if calls <= n:
             raise OSError("transient")
 
-    def on_event(key: str, state: DownloadState) -> None:
-        if state is DownloadState.DONE:
+    def ev(_key: str, state: TrackState) -> None:
+        if state is TrackState.PRESENT:
             done.set()
 
-    q = DownloadQueue(
-        downloader=flaky, debounce=0.01, max_attempts=5, on_event=on_event
-    )
-    runner = asyncio.create_task(q.run())
+    q = _queue(download=dl, debounce=0.01, max_attempts=5, on_event=ev)
+    task = await _run(q)
 
     q.select(_item("ok"))
-    await asyncio.wait_for(done.wait(), timeout=1.0)
+    await asyncio.wait_for(done.wait(), 1.0)
     assert calls == n + 1
 
     q.stop()
-    await runner
+    await task

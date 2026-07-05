@@ -1,12 +1,12 @@
 """Textual Pilot tests for the browse app (headless key-driven)."""
 
+import asyncio
 from pathlib import Path
 
 from music_cli import catalog
 from music_cli.device import load_copied
 from music_cli.device import record_copied
 from music_cli.syncq import DownloadItem
-from music_cli.syncq import DownloadState
 from music_cli.tui import BrowseApp
 
 
@@ -71,11 +71,11 @@ async def test_space_selects_whole_artist(tmp_path: Path):
         await pilot.press("space")
         await pilot.pause()
 
-    # Both the album track and the single got queued.
+    # Both the album track and the single got ticked (queued for download).
     duran = await catalog.query_tracks(cache, artist="Duran Duran")
     assert app._queue.counts()["pending"] == len(duran) == 2
     for track in duran:
-        assert app._queue.state(track.rel_path) is DownloadState.PENDING
+        assert app._queue.wants_present(track.rel_path) is True
 
 
 async def test_space_again_deselects(tmp_path: Path):
@@ -87,16 +87,17 @@ async def test_space_again_deselects(tmp_path: Path):
     app = BrowseApp(
         cache=cache, downloader=_noop, dest=tmp_path / "card", debounce=60.0
     )
+    duran = await catalog.query_tracks(cache, artist="Duran Duran")
     async with app.run_test() as pilot:
         await pilot.pause()
         await pilot.press("down")
-        await pilot.press("space")  # select artist
+        await pilot.press("space")  # tick artist
         await pilot.pause()
-        assert app._queue.counts()["pending"] == 2
-        await pilot.press("space")  # deselect artist
+        assert all(app._queue.wants_present(t.rel_path) for t in duran)
+        await pilot.press("space")  # un-tick artist
         await pilot.pause()
 
-    assert app._queue.counts()["pending"] == 0
+    assert not any(app._queue.wants_present(t.rel_path) for t in duran)
 
 
 async def test_present_tracks_start_checked(tmp_path: Path):
@@ -116,19 +117,46 @@ async def test_present_tracks_start_checked(tmp_path: Path):
         assert "☑" in str(artist_node.label)
 
 
+async def _wait_until(predicate, timeout: float = 2.0) -> None:
+    end = asyncio.get_event_loop().time() + timeout
+    while asyncio.get_event_loop().time() < end:
+        if predicate():
+            return
+        await asyncio.sleep(0.02)
+    assert predicate(), "condition not met within timeout"
+
+
 async def test_uncheck_deletes_from_card(tmp_path: Path):
     cache = await _cache(tmp_path)
     card = tmp_path / "card"
     duran = await catalog.query_tracks(cache, artist="Duran Duran")
     await _preload_card(card, duran)
 
-    app = BrowseApp(cache=cache, downloader=_noop, dest=card, debounce=60.0)
+    # Short debounce so the deletion actually fires during the test.
+    app = BrowseApp(cache=cache, downloader=_noop, dest=card, debounce=0.05)
     async with app.run_test() as pilot:
         await pilot.pause()
         await pilot.press("down")  # onto the (pre-ticked) artist
-        await pilot.press("space")  # un-tick → delete from card
-        await pilot.pause()
+        await pilot.press("space")  # un-tick → delete after the grace window
+        await _wait_until(lambda: not any((card / t.rel_path).exists() for t in duran))
+        assert await load_copied(card) == {}
 
+
+async def test_untick_then_retick_within_grace_keeps_files(tmp_path: Path):
+    cache = await _cache(tmp_path)
+    card = tmp_path / "card"
+    duran = await catalog.query_tracks(cache, artist="Duran Duran")
+    await _preload_card(card, duran)
+
+    app = BrowseApp(cache=cache, downloader=_noop, dest=card, debounce=0.3)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await pilot.press("down")
+        await pilot.press("space")  # un-tick
+        await pilot.press("space")  # ...changed my mind, well within 0.3s
+        await asyncio.sleep(0.5)  # let the (cancelled) window pass
+
+    # Nothing was deleted: the mistake was corrected in time.
     for track in duran:
-        assert not (card / track.rel_path).exists()
-    assert await load_copied(card) == {}
+        assert (card / track.rel_path).exists()
+    assert set(await load_copied(card)) == {t.rel_path for t in duran}

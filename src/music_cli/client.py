@@ -7,6 +7,7 @@ track on the SD card.
 
 from __future__ import annotations
 
+import contextlib
 import os
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -68,11 +69,18 @@ class MusicClient:
 async def _stream_to_file(resp: httpx.Response, dest: Path) -> int:
     tmp = dest.with_name(dest.name + ".part")
     written = 0
-    with open(tmp, "wb") as fh:
-        async for chunk in resp.aiter_bytes():
-            fh.write(chunk)
-            written += len(chunk)
-    os.replace(tmp, dest)
+    try:
+        with open(tmp, "wb") as fh:
+            async for chunk in resp.aiter_bytes():
+                fh.write(chunk)
+                written += len(chunk)
+        os.replace(tmp, dest)
+    except BaseException:
+        # On error or abort (e.g. an un-tick cancelling the download), don't
+        # leave a half-written .part behind.
+        with contextlib.suppress(OSError):
+            tmp.unlink()
+        raise
     return written
 
 

@@ -41,13 +41,8 @@ from music_cli.device import record_copied
 from music_cli.device import remove_copied
 from music_cli.syncq import Downloader
 from music_cli.syncq import DownloadItem
-from music_cli.syncq import DownloadQueue
-from music_cli.syncq import DownloadState
-
-# Queue states that mean a track is (or is about to be) on the card.
-_ON_CARD_STATES = frozenset(
-    {DownloadState.PENDING, DownloadState.DOWNLOADING, DownloadState.DONE}
-)
+from music_cli.syncq import SyncQueue
+from music_cli.syncq import TrackState
 
 
 class TrackSource(Protocol):
@@ -71,6 +66,7 @@ def format_status(counts: dict[str, int]) -> str:
     return (
         f"⧗ {counts.get('pending', 0)} pending   "
         f"⇩ {counts.get('downloading', 0)} copying   "
+        f"⌫ {counts.get('removing', 0)} removing   "
         f"✓ {counts.get('done', 0)} done   "
         f"✗ {counts.get('failed', 0)} failed"
     )
@@ -134,12 +130,17 @@ class BrowseApp(App):
         super().__init__()
         self._cache = Path(cache)
         self._dest = Path(dest)
-        self._present: set[str] = set()  # rel_paths already on the card
-        self._queue = DownloadQueue(
-            downloader=downloader, debounce=debounce, on_event=self._on_event
+        self._queue = SyncQueue(
+            download=downloader,
+            remove=self._remove_track,
+            debounce=debounce,
+            on_event=self._on_event,
         )
         self._tree: CheckTree | None = None
         self._status: Static | None = None
+
+    async def _remove_track(self, rel_path: str) -> None:
+        await remove_copied(self._dest, rel_path)
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
@@ -151,7 +152,7 @@ class BrowseApp(App):
 
     async def on_mount(self) -> None:
         assert self._tree is not None
-        self._present = set(await load_copied(self._dest))
+        self._queue.seed_present(await load_copied(self._dest))
         self.run_worker(self._queue.run(), exclusive=False)
         root = self._tree.root
         for artist in await catalog.list_artists(self._cache):
@@ -166,10 +167,8 @@ class BrowseApp(App):
         self._tree.focus()
 
     def _is_checked(self, rel_path: str) -> bool:
-        """A track is ticked if it is on the card or queued to go there."""
-        if rel_path in self._present:
-            return True
-        return self._queue.state(rel_path) in _ON_CARD_STATES
+        """A track is ticked if its intent is to be on the card."""
+        return self._queue.wants_present(rel_path)
 
     async def _group_checked(self, data: dict) -> bool:
         """A group is ticked iff every track under it is ticked."""
@@ -230,15 +229,11 @@ class BrowseApp(App):
         new = not data.get("checked", False)
         for track in await self._tracks_for(data):
             if new:
-                # Only queue a download for tracks not already on the card.
-                if not self._is_checked(track.rel_path):
-                    self._queue.select(track_item(track))
+                self._queue.select(track_item(track))
             else:
-                # Un-tick: cancel any pending download and delete the copy we
-                # placed on the card (device.remove_copied is the safe guard).
+                # Un-tick: after the debounce the queue aborts any download and
+                # deletes the copy (via the safe device.remove_copied guard).
                 self._queue.deselect(track.rel_path)
-                await remove_copied(self._dest, track.rel_path)
-                self._present.discard(track.rel_path)
         self._set_subtree_checked(node, new)
         self._refresh()
 
@@ -266,9 +261,7 @@ class BrowseApp(App):
 
     # -- progress + lifecycle ---------------------------------------------
 
-    def _on_event(self, key: str, state: object) -> None:
-        if state is DownloadState.DONE:
-            self._present.add(key)  # now truly on the card
+    def _on_event(self, key: str, state: TrackState) -> None:
         self.call_later(self._refresh)
 
     def _refresh(self) -> None:

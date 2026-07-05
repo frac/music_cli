@@ -28,9 +28,12 @@ def test_track_item_keys_by_rel_path():
 
 
 def test_format_status_renders_all_counts():
-    line = format_status({"pending": 2, "downloading": 1, "done": 5, "failed": 3})
+    line = format_status(
+        {"pending": 2, "downloading": 1, "removing": 4, "done": 5, "failed": 3}
+    )
     assert "2 pending" in line
     assert "1 copying" in line
+    assert "4 removing" in line
     assert "5 done" in line
     assert "3 failed" in line
 
