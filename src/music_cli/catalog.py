@@ -272,9 +272,32 @@ async def list_singles(db_path: str | Path, artist: str) -> list[CatalogTrack]:
     return await _query(db_path, "artist = ? AND album IS NULL", (artist,))
 
 
-async def list_loose(db_path: str | Path) -> list[CatalogTrack]:
-    """Return tracks with no artist (loose files at the library root)."""
+async def list_loose(
+    db_path: str | Path, matching: str | None = None
+) -> list[CatalogTrack]:
+    """Return tracks with no artist, optionally filtered by title substring."""
+    if matching:
+        return await _query(
+            db_path, "artist IS NULL AND title LIKE ?", (f"%{matching}%",)
+        )
     return await _query(db_path, "artist IS NULL", ())
+
+
+async def search_artists(db_path: str | Path, text: str) -> list[str]:
+    """Return artists whose name, albums or track titles match ``text``.
+
+    Case-insensitive substring match (SQLite ``LIKE``); used by the TUI's
+    type-to-search filter.
+    """
+    like = f"%{text}%"
+    async with connect(db_path) as conn:
+        cursor = await conn.execute(
+            "SELECT DISTINCT artist FROM tracks WHERE artist IS NOT NULL "
+            "AND (artist LIKE ? OR album LIKE ? OR title LIKE ?) "
+            "ORDER BY artist",
+            (like, like, like),
+        )
+        return [row["artist"] for row in await cursor.fetchall()]
 
 
 async def build(root: str | Path, db_path: str | Path) -> int:

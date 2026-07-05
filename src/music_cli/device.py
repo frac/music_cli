@@ -8,6 +8,7 @@ Two hidden files live at the SD-card root so state travels with the card:
 
 from __future__ import annotations
 
+import re
 from datetime import UTC
 from datetime import datetime
 from pathlib import Path
@@ -17,6 +18,43 @@ from music_cli.db import connect
 
 DEVICE_DB_NAME = ".music_cli.db"
 CATALOG_CACHE_NAME = ".music_cli.catalog.db"
+
+#: Characters FAT32/exFAT/NTFS refuse in filenames (plus control chars).
+_FAT_ILLEGAL = re.compile(r'[<>:"\\|?*\x00-\x1f]')
+
+#: Windows-reserved device names (case-insensitive, extension ignored).
+_RESERVED = frozenset(
+    {"con", "prn", "aux", "nul"}
+    | {f"com{i}" for i in range(1, 10)}
+    | {f"lpt{i}" for i in range(1, 10)}
+)
+
+
+def _safe_segment(name: str) -> str:
+    """Make one path segment legal on FAT32/exFAT/NTFS."""
+    cleaned = _FAT_ILLEGAL.sub("_", name).rstrip(" .")
+    if not cleaned:
+        cleaned = "_"
+    stem = cleaned.split(".", 1)[0].lower()
+    if stem in _RESERVED:
+        cleaned = f"_{cleaned}"
+    return cleaned
+
+
+def safe_rel_path(rel_path: str) -> str:
+    """Sanitize every segment of a catalog rel_path for SD-card filesystems.
+
+    The catalog key stays the *original* rel_path; only the on-card location
+    uses the sanitized form, so a library name like ``AC/DC: Live.mp3`` (legal
+    on ext4) still copies onto a FAT32 card.
+    """
+    return "/".join(_safe_segment(seg) for seg in rel_path.split("/") if seg)
+
+
+def card_path(dest: str | Path, rel_path: str) -> Path:
+    """Return the on-card path for a catalog track (FAT-safe)."""
+    return Path(dest) / safe_rel_path(rel_path)
+
 
 DEVICE_SCHEMA = """
 CREATE TABLE IF NOT EXISTS copied (
@@ -138,7 +176,7 @@ async def remove_copied(dest: str | Path, rel_path: str) -> bool:
         if await cursor.fetchone() is None:
             return False  # we have no record of putting this here — hands off
 
-        target = dest / rel_path
+        target = card_path(dest, rel_path)
         deleted = False
         try:
             inside = target.resolve().is_relative_to(dest)

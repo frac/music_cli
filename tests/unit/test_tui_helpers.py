@@ -45,3 +45,15 @@ def test_format_status_defaults_missing_to_zero():
 def test_checkbox_markup_toggles():
     assert checkbox_markup("Queen", checked=False) == "☐ Queen"
     assert checkbox_markup("Queen", checked=True) == "[green]☑[/] Queen"
+    assert checkbox_markup("Queen", checked=None) == "[yellow]◐[/] Queen"
+
+
+def test_human_size():
+    from music_cli.tui import human_size
+
+    assert human_size(0) == "0 B"
+    assert human_size(999) == "999 B"
+    assert human_size(2048) == "2.0 KB"
+    assert human_size(5 * 1024 * 1024) == "5.0 MB"
+    assert human_size(3 * 1024**3) == "3.0 GB"
+    assert human_size(5000 * 1024**3) == "5000.0 GB"

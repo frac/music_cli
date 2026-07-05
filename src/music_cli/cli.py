@@ -17,12 +17,17 @@ import argparse
 import asyncio
 from pathlib import Path
 
+from music_cli import __version__
+
 DEFAULT_DB = "catalog.db"
 
 
 def build_parser() -> argparse.ArgumentParser:
     """Construct the top-level argument parser."""
     parser = argparse.ArgumentParser(prog="music", description=__doc__)
+    parser.add_argument(
+        "--version", action="version", version=f"%(prog)s {__version__}"
+    )
     sub = parser.add_subparsers(dest="command", required=True)
 
     catalog = sub.add_parser("catalog", help="build or update the catalog")
@@ -37,6 +42,12 @@ def build_parser() -> argparse.ArgumentParser:
     serve.add_argument("--db", type=Path, default=Path(DEFAULT_DB))
     serve.add_argument("--host", default="0.0.0.0")
     serve.add_argument("--port", type=int, default=8000)
+    serve.add_argument(
+        "--refresh-minutes",
+        type=float,
+        default=10.0,
+        help="rescan the library this often (0 disables)",
+    )
 
     for name, help_ in (
         ("sync", "copy tracks to the SD card"),
@@ -44,13 +55,40 @@ def build_parser() -> argparse.ArgumentParser:
         ("browse", "interactive TUI"),
     ):
         p = sub.add_parser(name, help=help_)
-        p.add_argument("--server", required=True, help="base URL of the server")
-        p.add_argument("--dest", type=Path, required=True, help="SD-card dir")
+        p.add_argument(
+            "--server",
+            help="base URL of the server (remembered after first use)",
+        )
+        p.add_argument(
+            "--dest",
+            type=Path,
+            help="destination dir (default: detected card or remembered dir)",
+        )
         if name == "sync":
             p.add_argument("--artist", help="only this artist")
             p.add_argument("--album", help="only this album")
 
     return parser
+
+
+def _resolve_target(args: argparse.Namespace) -> tuple[str, Path]:
+    """Resolve server+dest from flags/card/config; remember on success."""
+    from music_cli import config
+
+    try:
+        server, dest = config.resolve(args.server, args.dest)
+    except config.ResolutionError as exc:
+        raise SystemExit(f"music: {exc}") from exc
+    # Remember the server always; remember dest only when explicitly given,
+    # so a transient auto-detected card never overwrites e.g. a phone dir.
+    saved = config.load()
+    config.save(
+        config.Settings(
+            server=server,
+            dest=str(args.dest) if args.dest else saved.dest,
+        )
+    )
+    return server, dest
 
 
 def _cmd_catalog(args: argparse.Namespace) -> int:
@@ -73,7 +111,8 @@ def _cmd_serve(args: argparse.Namespace) -> int:
 
     from music_cli.server import create_app
 
-    app = create_app(args.root, args.db)
+    refresh = args.refresh_minutes * 60 if args.refresh_minutes > 0 else None
+    app = create_app(args.root, args.db, refresh_seconds=refresh)
     uvicorn.run(app, host=args.host, port=args.port)
     return 0
 
@@ -81,24 +120,25 @@ def _cmd_serve(args: argparse.Namespace) -> int:
 def _cmd_sync(args: argparse.Namespace) -> int:
     from music_cli.sync import run_sync
 
-    copied = asyncio.run(
-        run_sync(args.server, args.dest, artist=args.artist, album=args.album)
-    )
-    print(f"Copied {copied} track(s) → {args.dest}")
+    server, dest = _resolve_target(args)
+    copied = asyncio.run(run_sync(server, dest, artist=args.artist, album=args.album))
+    print(f"Copied {copied} track(s) → {dest}")
     return 0
 
 
 def _cmd_status(args: argparse.Namespace) -> int:
     from music_cli.sync import run_status
 
-    asyncio.run(run_status(args.server, args.dest))
+    server, dest = _resolve_target(args)
+    asyncio.run(run_status(server, dest))
     return 0
 
 
 def _cmd_browse(args: argparse.Namespace) -> int:
     from music_cli.tui import run_browse
 
-    run_browse(args.server, args.dest)
+    server, dest = _resolve_target(args)
+    run_browse(server, dest)
     return 0
 
 

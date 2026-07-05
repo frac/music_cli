@@ -13,6 +13,7 @@ from pathlib import Path
 from music_cli import catalog
 from music_cli.client import MusicClient
 from music_cli.client import open_client
+from music_cli.device import card_path
 from music_cli.device import catalog_cache_path
 from music_cli.device import load_copied
 from music_cli.device import needs_copy
@@ -78,7 +79,7 @@ async def sync_tracks(
     for track in tracks:
         if not needs_copy(track, copied):
             continue
-        target = dest / track.rel_path
+        target = card_path(dest, track.rel_path)
         target.parent.mkdir(parents=True, exist_ok=True)
         size = await client.download_track(track.rel_path, target)
         await record_copied(dest, track.rel_path, size, track.mtime_ns, generated_at)

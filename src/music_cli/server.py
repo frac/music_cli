@@ -12,6 +12,11 @@ server needs no dynamic browse endpoints. It only:
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
+import logging
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI
@@ -21,7 +26,10 @@ from fastapi import Response
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
+from music_cli import catalog
 from music_cli.catalog import read_meta
+
+logger = logging.getLogger(__name__)
 
 
 def file_etag(path: Path) -> str:
@@ -30,19 +38,58 @@ def file_etag(path: Path) -> str:
     return f'"{stat.st_size:x}-{stat.st_mtime_ns:x}"'
 
 
-def create_app(root: str | Path, db_path: str | Path) -> FastAPI:
+def create_app(
+    root: str | Path,
+    db_path: str | Path,
+    *,
+    refresh_seconds: float | None = None,
+) -> FastAPI:
     """Build the FastAPI application.
 
     Args:
         root: Library root directory whose audio files are served under ``/files``.
         db_path: Path to the SQLite catalog snapshot.
+        refresh_seconds: When set, run ``catalog.update`` at startup and then
+            every this many seconds, so library edits (e.g. by beets) show up
+            without a manual rebuild.
 
     Returns:
         A configured :class:`fastapi.FastAPI` instance.
     """
     root = Path(root)
     db_path = Path(db_path)
-    app = FastAPI(title="Music CLI server")
+
+    async def _refresh_once() -> None:
+        try:
+            result = await catalog.update(root, db_path)
+            if result.added or result.changed or result.removed:
+                logger.info(
+                    "catalog refreshed: +%d ~%d -%d",
+                    result.added,
+                    result.changed,
+                    result.removed,
+                )
+        except Exception:
+            logger.exception("catalog refresh failed")
+
+    async def _refresh_loop(interval: float) -> None:
+        while True:
+            await asyncio.sleep(interval)
+            await _refresh_once()
+
+    @asynccontextmanager
+    async def lifespan(_: FastAPI) -> AsyncIterator[None]:
+        task: asyncio.Task[None] | None = None
+        if refresh_seconds:
+            await _refresh_once()  # catch up immediately on boot
+            task = asyncio.create_task(_refresh_loop(refresh_seconds))
+        yield
+        if task is not None:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+
+    app = FastAPI(title="Music CLI server", lifespan=lifespan)
 
     def require_db() -> Path:
         if not db_path.exists():

@@ -142,6 +142,98 @@ async def test_uncheck_deletes_from_card(tmp_path: Path):
         assert await load_copied(card) == {}
 
 
+async def test_partially_present_artist_shows_half_tick(tmp_path: Path):
+    cache = await _cache(tmp_path)
+    card = tmp_path / "card"
+    duran = await catalog.query_tracks(cache, artist="Duran Duran")
+    await _preload_card(card, duran[:1])  # only one of the two tracks
+
+    app = BrowseApp(cache=cache, downloader=_noop, dest=card, debounce=60.0)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        assert app._tree is not None
+        artist_node = app._tree.root.children[0]
+        assert artist_node.data is not None
+        assert artist_node.data["checked"] is None  # partial
+        assert "◐" in str(artist_node.label)
+
+        # Space on a partial group completes the selection (queues the rest).
+        await pilot.press("down")
+        await pilot.press("space")
+        await pilot.pause()
+        assert all(app._queue.wants_present(t.rel_path) for t in duran)
+
+
+async def test_search_filters_and_escape_clears(tmp_path: Path):
+    cache = await _cache(tmp_path)
+    card = tmp_path / "card"
+    card.mkdir()
+
+    app = BrowseApp(cache=cache, downloader=_noop, dest=card, debounce=60.0)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        assert app._tree is not None
+        # Full tree: 1 artist + the loose group.
+        assert len(app._tree.root.children) == 2
+
+        await pilot.press("slash")
+        for ch in "girls":  # matches the single's title
+            await pilot.press(ch)
+        await pilot.pause()
+        labels = [str(c.label) for c in app._tree.root.children]
+        assert len(labels) == 1
+        assert "Duran Duran" in labels[0]
+
+        await pilot.press("escape")
+        await pilot.pause()
+        assert len(app._tree.root.children) == 2  # filter cleared
+
+
+async def test_retry_key_requeues_failed(tmp_path: Path):
+    cache = await _cache(tmp_path)
+    card = tmp_path / "card"
+    card.mkdir()
+    attempts = 0
+
+    async def failing(_: DownloadItem) -> None:
+        nonlocal attempts
+        attempts += 1
+        raise OSError("no network")
+
+    app = BrowseApp(cache=cache, downloader=failing, dest=card, debounce=0.02)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await pilot.press("down", "down")  # skip artist → its expansion target
+        # Tick the single loose track group instead: go to loose group.
+        await pilot.press("space")
+        await _wait_until(lambda: bool(app._queue.failed_keys()))
+        before = attempts
+        await pilot.press("r")
+        await _wait_until(lambda: attempts > before)
+
+
+async def test_full_card_skips_tracks(tmp_path: Path, monkeypatch):
+    cache = await _cache(tmp_path)
+    card = tmp_path / "card"
+    card.mkdir()
+
+    # 5 bytes total free: first 5-byte track fits, second (also 5 bytes) doesn't.
+    monkeypatch.setattr(
+        BrowseApp,
+        "_free_bytes",
+        lambda self: 5 - sum(self._reserved.values()),
+    )
+
+    app = BrowseApp(cache=cache, downloader=_noop, dest=card, debounce=60.0)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await pilot.press("down")
+        await pilot.press("space")  # artist has 2x5-byte tracks; only 1 fits
+        await pilot.pause()
+
+    assert app._queue.counts()["pending"] == 1
+
+
 async def test_untick_then_retick_within_grace_keeps_files(tmp_path: Path):
     cache = await _cache(tmp_path)
     card = tmp_path / "card"

@@ -130,6 +130,30 @@ class SyncQueue:
         """Return the observable state of ``key`` (``None`` if unknown)."""
         return self._state.get(key)
 
+    def failed_keys(self) -> list[str]:
+        """Return the keys currently in the FAILED state."""
+        return [k for k, s in self._state.items() if s is TrackState.FAILED]
+
+    def retry_failed(self) -> int:
+        """Re-queue every failed track whose item is known.
+
+        Returns:
+            The number of tracks re-queued.
+        """
+        count = 0
+        for key in self.failed_keys():
+            item = self._items.get(key)
+            if item is not None:
+                self.select(item)
+                count += 1
+        return count
+
+    def title_of(self, key: str) -> str:
+        """Best-effort display name for a key (payload title or the key)."""
+        item = self._items.get(key)
+        payload = getattr(item, "payload", None)
+        return getattr(payload, "title", None) or key
+
     def counts(self) -> dict[str, int]:
         """Return totals for the progress footer."""
         counts = {

@@ -89,3 +89,16 @@ async def test_files_missing_or_traversal(tmp_path: Path, target: str):
     async with client_for(root, db) as c:
         resp = await c.get(target)
     assert resp.status_code in (403, 404)
+
+
+async def test_lifespan_refresh_builds_catalog_on_startup(tmp_path: Path):
+    make_library(tmp_path)
+    db = tmp_path / "catalog.db"
+    # Long interval: only the immediate startup refresh matters here.
+    app = create_app(tmp_path, db, refresh_seconds=3600)
+    assert not db.exists()
+
+    async with app.router.lifespan_context(app):
+        assert db.exists()
+        meta = await catalog.read_meta(db)
+        assert meta["track_count"] == "3"
