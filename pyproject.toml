@@ -1,0 +1,68 @@
+[project]
+name = "music-cli"
+version = "0.1.0"
+description = "Music client to copy music between servers"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "fastapi",
+    "uvicorn",
+    "aiosqlite",
+    "httpx",
+    "textual",
+]
+
+[project.scripts]
+music = "music_cli.cli:main"
+
+[dependency-groups]
+dev = [
+    "pytest",
+    "pytest-asyncio",
+    "pytest-cov",
+    "ty",
+    "ruff",
+    "pre-commit",
+    "pact-python",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/music_cli"]
+
+[tool.ruff]
+line-length = 88
+target-version = "py314"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "SIM", "RUF"]
+
+[tool.ruff.lint.isort]
+force-single-line = true
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests/unit", "tests/integration"]
+addopts = "--strict-markers --cov=music_cli --cov-report=term-missing --cov-fail-under=85"
+markers = [
+    "e2e: requires docker-compose backing services",
+    "contract: pact provider verification",
+]
+
+[tool.coverage.run]
+branch = true
+source = ["src/music_cli"]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "raise NotImplementedError",
+    "if TYPE_CHECKING:",
+]
