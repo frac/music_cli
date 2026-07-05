@@ -38,9 +38,11 @@ music sync   --server http://server:8000 --dest /media/sdcard --artist "Queen"
 music status --server http://server:8000 --dest /media/sdcard
 ```
 
-In `browse`, expand `Artist → Album → Track` and press <kbd>Enter</kbd> on any
-node to queue it; downloads begin a few seconds later (a mis-click undone in time
-never downloads) and progress shows at the bottom.
+In `browse`, navigate `Artist → Album → Track` (albums, album-less *singles* and
+a `(loose tracks)` group all appear). <kbd>Enter</kbd> folds/unfolds a node;
+<kbd>Space</kbd> toggles its checkbox (`☐`→`☑`). Ticking an artist or album ticks
+all its tracks. Ticked tracks download in the background a few seconds later (a
+mis-click un-ticked in time never downloads); progress shows at the bottom.
 
 ## Development
 

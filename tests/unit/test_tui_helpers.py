@@ -2,6 +2,7 @@
 
 from music_cli.catalog import CatalogTrack
 from music_cli.syncq import DownloadItem
+from music_cli.tui import checkbox_markup
 from music_cli.tui import format_status
 from music_cli.tui import track_item
 
@@ -36,3 +37,8 @@ def test_format_status_renders_all_counts():
 
 def test_format_status_defaults_missing_to_zero():
     assert "0 pending" in format_status({})
+
+
+def test_checkbox_markup_toggles():
+    assert checkbox_markup("Queen", checked=False) == "☐ Queen"
+    assert checkbox_markup("Queen", checked=True) == "[green]☑[/] Queen"

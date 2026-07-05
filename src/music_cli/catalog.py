@@ -79,9 +79,15 @@ def parse_title(stem: str) -> tuple[int | None, str]:
 def parse_meta(rel_path: str) -> tuple[str | None, str | None, int | None, str]:
     """Derive ``(artist, album, track_no, title)`` from a relative path.
 
-    The two directories immediately above the file are treated as
-    ``artist`` and ``album`` respectively; shallower layouts degrade
-    gracefully to ``None``.
+    The **top-level folder** under the library root is the artist. A file sitting
+    directly in that folder is a *single* (``album is None``); a file one level
+    deeper takes that intermediate folder as its album. A file loose at the root
+    has no artist.
+
+    Examples:
+        ``Duran Duran/Girls on Film.mp3``        → artist, no album (a single)
+        ``Duran Duran/Decade/06 - Song.mp3``     → artist + album
+        ``loose.mp3``                            → no artist, no album
 
     Args:
         rel_path: POSIX-style path relative to the library root.
@@ -93,8 +99,8 @@ def parse_meta(rel_path: str) -> tuple[str | None, str | None, int | None, str]:
     filename = parts[-1]
     stem = filename.rsplit(".", 1)[0] if "." in filename else filename
     track_no, title = parse_title(stem)
-    album = parts[-2] if len(parts) >= 2 else None
-    artist = parts[-3] if len(parts) >= 3 else None
+    artist = parts[0] if len(parts) >= 2 else None
+    album = parts[-2] if len(parts) >= 3 else None
     return artist, album, track_no, title
 
 
@@ -249,6 +255,26 @@ async def list_albums(db_path: str | Path, artist: str) -> list[str]:
             (artist,),
         )
         return [row["album"] for row in await cursor.fetchall()]
+
+
+async def _query(db_path: str | Path, where: str, params: tuple) -> list[CatalogTrack]:
+    sql = (
+        f"SELECT {_QUERY_COLUMNS} FROM tracks WHERE {where} "
+        "ORDER BY track_no, title, rel_path"
+    )
+    async with connect(db_path) as conn:
+        cursor = await conn.execute(sql, params)
+        return [CatalogTrack(**dict(row)) for row in await cursor.fetchall()]
+
+
+async def list_singles(db_path: str | Path, artist: str) -> list[CatalogTrack]:
+    """Return an artist's album-less tracks (singles), sorted by title."""
+    return await _query(db_path, "artist = ? AND album IS NULL", (artist,))
+
+
+async def list_loose(db_path: str | Path) -> list[CatalogTrack]:
+    """Return tracks with no artist (loose files at the library root)."""
+    return await _query(db_path, "artist IS NULL", ())
 
 
 async def build(root: str | Path, db_path: str | Path) -> int:

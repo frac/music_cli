@@ -34,9 +34,13 @@ def test_parse_title(stem, expected):
             "Queen/Greatest Hits/03 Bohemian Rhapsody.flac",
             ("Queen", "Greatest Hits", 3, "Bohemian Rhapsody"),
         ),
-        # Only album/file depth: no artist.
-        ("Some Album/02 - Track.mp3", (None, "Some Album", 2, "Track")),
-        # Bare file: no artist, no album.
+        # Single directly under the artist folder: artist, no album.
+        (
+            "Duran Duran/Duran Duran - Girls on Film.mp3",
+            ("Duran Duran", None, None, "Duran Duran - Girls on Film"),
+        ),
+        ("Queen/We Will Rock You.mp3", ("Queen", None, None, "We Will Rock You")),
+        # Bare file at the root: no artist, no album.
         ("loose.mp3", (None, None, None, "loose")),
         # Backslashes normalise to forward slashes.
         (
