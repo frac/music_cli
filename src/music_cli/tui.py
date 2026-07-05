@@ -36,10 +36,18 @@ from textual.widgets.tree import TreeNode
 
 from music_cli import catalog
 from music_cli.catalog import CatalogTrack
+from music_cli.device import load_copied
 from music_cli.device import record_copied
+from music_cli.device import remove_copied
 from music_cli.syncq import Downloader
 from music_cli.syncq import DownloadItem
 from music_cli.syncq import DownloadQueue
+from music_cli.syncq import DownloadState
+
+# Queue states that mean a track is (or is about to be) on the card.
+_ON_CARD_STATES = frozenset(
+    {DownloadState.PENDING, DownloadState.DOWNLOADING, DownloadState.DONE}
+)
 
 
 class TrackSource(Protocol):
@@ -116,10 +124,17 @@ class BrowseApp(App):
     BINDINGS = [Binding("q", "quit", "Quit")]  # noqa: RUF012
 
     def __init__(
-        self, *, cache: str | Path, downloader: Downloader, debounce: float = 5.0
+        self,
+        *,
+        cache: str | Path,
+        downloader: Downloader,
+        dest: str | Path,
+        debounce: float = 5.0,
     ) -> None:
         super().__init__()
         self._cache = Path(cache)
+        self._dest = Path(dest)
+        self._present: set[str] = set()  # rel_paths already on the card
         self._queue = DownloadQueue(
             downloader=downloader, debounce=debounce, on_event=self._on_event
         )
@@ -136,14 +151,30 @@ class BrowseApp(App):
 
     async def on_mount(self) -> None:
         assert self._tree is not None
+        self._present = set(await load_copied(self._dest))
         self.run_worker(self._queue.run(), exclusive=False)
         root = self._tree.root
         for artist in await catalog.list_artists(self._cache):
-            self._add(root, {"kind": "artist", "artist": artist, "base": artist})
+            data = {"kind": "artist", "artist": artist, "base": artist}
+            data["checked"] = await self._group_checked(data)
+            self._add(root, data)
         if await catalog.list_loose(self._cache):
-            self._add(root, {"kind": "loose", "base": "(loose tracks)"})
+            loose = {"kind": "loose", "base": "(loose tracks)"}
+            loose["checked"] = await self._group_checked(loose)
+            self._add(root, loose)
         root.expand()
         self._tree.focus()
+
+    def _is_checked(self, rel_path: str) -> bool:
+        """A track is ticked if it is on the card or queued to go there."""
+        if rel_path in self._present:
+            return True
+        return self._queue.state(rel_path) in _ON_CARD_STATES
+
+    async def _group_checked(self, data: dict) -> bool:
+        """A group is ticked iff every track under it is ticked."""
+        tracks = await self._tracks_for(data)
+        return bool(tracks) and all(self._is_checked(t.rel_path) for t in tracks)
 
     # -- node construction -------------------------------------------------
 
@@ -167,30 +198,27 @@ class BrowseApp(App):
         data = node.data or {}
         if node.children or data.get("kind") not in ("artist", "album", "loose"):
             return
-        checked = data.get("checked", False)
         if data["kind"] == "artist":
             for album in await catalog.list_albums(self._cache, data["artist"]):
-                self._add(
-                    node,
-                    {
-                        "kind": "album",
-                        "artist": data["artist"],
-                        "album": album,
-                        "base": album,
-                        "checked": checked,
-                    },
-                )
+                album_data = {
+                    "kind": "album",
+                    "artist": data["artist"],
+                    "album": album,
+                    "base": album,
+                }
+                album_data["checked"] = await self._group_checked(album_data)
+                self._add(node, album_data)
             for track in await catalog.list_singles(self._cache, data["artist"]):
-                self._add_track(node, track, checked)
+                self._add_track(node, track, self._is_checked(track.rel_path))
         elif data["kind"] == "album":
             tracks = await catalog.query_tracks(
                 self._cache, artist=data["artist"], album=data["album"]
             )
             for track in tracks:
-                self._add_track(node, track, checked)
+                self._add_track(node, track, self._is_checked(track.rel_path))
         else:  # loose
             for track in await catalog.list_loose(self._cache):
-                self._add_track(node, track, checked)
+                self._add_track(node, track, self._is_checked(track.rel_path))
 
     # -- selection ---------------------------------------------------------
 
@@ -202,9 +230,15 @@ class BrowseApp(App):
         new = not data.get("checked", False)
         for track in await self._tracks_for(data):
             if new:
-                self._queue.select(track_item(track))
+                # Only queue a download for tracks not already on the card.
+                if not self._is_checked(track.rel_path):
+                    self._queue.select(track_item(track))
             else:
+                # Un-tick: cancel any pending download and delete the copy we
+                # placed on the card (device.remove_copied is the safe guard).
                 self._queue.deselect(track.rel_path)
+                await remove_copied(self._dest, track.rel_path)
+                self._present.discard(track.rel_path)
         self._set_subtree_checked(node, new)
         self._refresh()
 
@@ -233,6 +267,8 @@ class BrowseApp(App):
     # -- progress + lifecycle ---------------------------------------------
 
     def _on_event(self, key: str, state: object) -> None:
+        if state is DownloadState.DONE:
+            self._present.add(key)  # now truly on the card
         self.call_later(self._refresh)
 
     def _refresh(self) -> None:
@@ -260,6 +296,8 @@ async def _main(server: str, dest: str | Path) -> None:  # pragma: no cover
         cache = await refresh_catalog(client, dest)
         generated_at = (await catalog.read_meta(cache)).get("generated_at")
         app = BrowseApp(
-            cache=cache, downloader=make_downloader(client, dest, generated_at)
+            cache=cache,
+            downloader=make_downloader(client, dest, generated_at),
+            dest=dest,
         )
         await app.run_async()

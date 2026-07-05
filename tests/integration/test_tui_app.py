@@ -3,9 +3,24 @@
 from pathlib import Path
 
 from music_cli import catalog
+from music_cli.device import load_copied
+from music_cli.device import record_copied
 from music_cli.syncq import DownloadItem
 from music_cli.syncq import DownloadState
 from music_cli.tui import BrowseApp
+
+
+async def _noop(_: DownloadItem) -> None:
+    return None
+
+
+async def _preload_card(card: Path, tracks) -> None:
+    """Place tracks on the card and record them, as a prior sync would."""
+    for track in tracks:
+        path = card / track.rel_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"audio")
+        await record_copied(card, track.rel_path, 5, track.mtime_ns, "x")
 
 
 def _make_library(root: Path) -> None:
@@ -46,7 +61,9 @@ async def test_space_selects_whole_artist(tmp_path: Path):
         return None
 
     # Long debounce so selected tracks stay PENDING for assertions.
-    app = BrowseApp(cache=cache, downloader=_noop, debounce=60.0)
+    app = BrowseApp(
+        cache=cache, downloader=_noop, dest=tmp_path / "card", debounce=60.0
+    )
     async with app.run_test() as pilot:
         await pilot.pause()
         # Root is expanded; move to the first artist and tick it.
@@ -67,7 +84,9 @@ async def test_space_again_deselects(tmp_path: Path):
     async def _noop(_: DownloadItem) -> None:
         return None
 
-    app = BrowseApp(cache=cache, downloader=_noop, debounce=60.0)
+    app = BrowseApp(
+        cache=cache, downloader=_noop, dest=tmp_path / "card", debounce=60.0
+    )
     async with app.run_test() as pilot:
         await pilot.pause()
         await pilot.press("down")
@@ -78,3 +97,38 @@ async def test_space_again_deselects(tmp_path: Path):
         await pilot.pause()
 
     assert app._queue.counts()["pending"] == 0
+
+
+async def test_present_tracks_start_checked(tmp_path: Path):
+    cache = await _cache(tmp_path)
+    card = tmp_path / "card"
+    duran = await catalog.query_tracks(cache, artist="Duran Duran")
+    await _preload_card(card, duran)
+
+    app = BrowseApp(cache=cache, downloader=_noop, dest=card, debounce=60.0)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        assert app._tree is not None
+        artist_node = app._tree.root.children[0]
+        # Fully-present artist is pre-ticked on open.
+        assert artist_node.data is not None
+        assert artist_node.data["checked"] is True
+        assert "☑" in str(artist_node.label)
+
+
+async def test_uncheck_deletes_from_card(tmp_path: Path):
+    cache = await _cache(tmp_path)
+    card = tmp_path / "card"
+    duran = await catalog.query_tracks(cache, artist="Duran Duran")
+    await _preload_card(card, duran)
+
+    app = BrowseApp(cache=cache, downloader=_noop, dest=card, debounce=60.0)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await pilot.press("down")  # onto the (pre-ticked) artist
+        await pilot.press("space")  # un-tick → delete from card
+        await pilot.pause()
+
+    for track in duran:
+        assert not (card / track.rel_path).exists()
+    assert await load_copied(card) == {}

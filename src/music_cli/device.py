@@ -87,3 +87,68 @@ def needs_copy(track: CatalogTrack, copied: dict[str, int]) -> bool:
     """
     previous = copied.get(track.rel_path)
     return previous is None or previous != track.size_bytes
+
+
+def _prune_empty_dirs(directory: Path, root: Path) -> None:
+    """Remove now-empty directories from ``directory`` up towards ``root``.
+
+    ``Path.rmdir`` only removes empty directories, so this can never delete a
+    file; it stops at ``root`` or the first non-empty parent.
+    """
+    directory = directory.resolve()
+    root = root.resolve()
+    while directory != root and directory.is_relative_to(root):
+        try:
+            directory.rmdir()
+        except OSError:
+            break
+        directory = directory.parent
+
+
+async def remove_copied(dest: str | Path, rel_path: str) -> bool:
+    """Delete a track we previously copied to the card — and only such a track.
+
+    Safety rules (all must hold for the file to be unlinked):
+
+    * ``rel_path`` is **recorded in this card's device DB** — i.e. we put it
+      here. Files we never copied are never touched.
+    * The target is a real, non-symlink file that resolves to a path **inside**
+      ``dest``. A symlink or ``..`` escape pointing at music elsewhere is left
+      alone.
+
+    The device-DB record is always cleared (the track is no longer "on the
+    card"), even if the file was already gone or was refused deletion.
+
+    Args:
+        dest: SD-card directory.
+        rel_path: Track path relative to the library root.
+
+    Returns:
+        ``True`` if a file was actually deleted.
+    """
+    dest = Path(dest).resolve()
+    db = device_db_path(dest)
+    if not db.exists():
+        return False
+
+    async with connect(db) as conn:
+        cursor = await conn.execute(
+            "SELECT 1 FROM copied WHERE rel_path = ?", (rel_path,)
+        )
+        if await cursor.fetchone() is None:
+            return False  # we have no record of putting this here — hands off
+
+        target = dest / rel_path
+        deleted = False
+        try:
+            inside = target.resolve().is_relative_to(dest)
+        except OSError:
+            inside = False
+        if inside and target.is_file() and not target.is_symlink():
+            target.unlink()
+            deleted = True
+            _prune_empty_dirs(target.parent, dest)
+
+        await conn.execute("DELETE FROM copied WHERE rel_path = ?", (rel_path,))
+        await conn.commit()
+    return deleted
